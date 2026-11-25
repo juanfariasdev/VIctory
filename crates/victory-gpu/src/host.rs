@@ -1476,63 +1476,90 @@ impl HostList {
         self.rebind.swap(false, Ordering::Relaxed)
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
-        // Depth textures and their twins first, from their real states and
-        // back: the side each first use needs, made newer.
+    /// Runs `copy_twin` for each depth texture whose side this list's
+    /// prelude must copy while textures still hold their pre-list states,
+    /// then advances those states to where this list leaves them and returns
+    /// the entry transitions (`None` when the prelude has nothing to record).
+    fn plan_prelude(
+        &self,
+        mut copy_twin: impl FnMut(
+            &std::sync::Arc<crate::resource::HostTexture>,
+            &crate::twin::Twin,
+            bool,
+        ),
+    ) -> Option<Vec<D3D12_RESOURCE_BARRIER>> {
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let moves = states
             .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
-            .collect();
-        if barriers.is_empty() && copies.is_empty() {
+            .any(|(first, _, copy)| copy.state.load(Ordering::Relaxed) != *first);
+        if !moves && copies.is_empty() {
+            for (_, last, copy) in states.values() {
+                copy.state.store(*last, Ordering::Relaxed);
+            }
             return None;
         }
+        for (depth, to_depth) in &copies {
+            if let Some(Some(twin)) = depth.twin.get() {
+                copy_twin(depth, twin, *to_depth);
+            }
+        }
+        Some(
+            states
+                .values()
+                .filter_map(|(first, last, copy)| {
+                    let real = copy.state.swap(*last, Ordering::Relaxed);
+                    (real != *first).then(|| {
+                        transition(
+                            &copy.texture,
+                            D3D12_RESOURCE_STATES(real as i32),
+                            D3D12_RESOURCE_STATES(*first as i32),
+                        )
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// At submission: the list that moves each texture this list uses from
+    /// its real state to the one the list starts with; the textures' real
+    /// states become those the list ends with.
+    fn prelude(&self) -> Option<ID3D12CommandList> {
         let (allocator, list) = &self.prelude;
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                for (depth, to_depth) in &copies {
-                    let Some(Some(twin)) = depth.twin.get() else { continue };
-                    // From each texture's real state to the copy's and back.
+        let mut opened: Option<windows::core::Result<()>> = None;
+        // Depth textures and their twins first, from their real states and
+        // back: the side each first use needs, made newer, before `states`
+        // replaces the real states with where this list leaves them.
+        let barriers = self.plan_prelude(|depth, twin, to_depth| {
+            // SAFETY: the prelude is not executing (every submission is
+            // waited for); the textures are live.
+            unsafe {
+                let open = opened.get_or_insert_with(|| {
+                    allocator.Reset().and_then(|()| list.Reset(allocator, None))
+                });
+                if open.is_ok() {
                     let mut back = Vec::new();
-                    twin.copy(list, depth, *to_depth, &mut |t, wanted| {
-                        let real = t.state.load(Ordering::Relaxed);
-                        let wanted = legal_state(&t.texture, wanted);
-                        (real != wanted).then(|| {
-                            back.push(transition(
-                                &t.texture,
-                                D3D12_RESOURCE_STATES(wanted as i32),
-                                D3D12_RESOURCE_STATES(real as i32),
-                            ));
-                            transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32))
-                        })
+                    twin.copy(list, depth, to_depth, &mut |t, wanted| {
+                        from_real_state(t, wanted, &mut back)
                     });
                     if !back.is_empty() {
                         list.ResourceBarrier(&back);
                     }
                 }
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
+            }
+        })?;
+        // SAFETY: as above.
+        let recorded = unsafe {
+            opened
+                .unwrap_or_else(|| allocator.Reset().and_then(|()| list.Reset(allocator, None)))
+                .and_then(|()| {
+                    if !barriers.is_empty() {
+                        list.ResourceBarrier(&barriers);
+                    }
+                    list.Close()
+                })
         };
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
@@ -2807,6 +2834,27 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+fn from_real_state(
+    t: &std::sync::Arc<crate::resource::HostTexture>,
+    wanted: u32,
+    back: &mut Vec<D3D12_RESOURCE_BARRIER>,
+) -> Option<D3D12_RESOURCE_BARRIER> {
+    let real = t.state.load(Ordering::Relaxed);
+    let wanted = legal_state(&t.texture, wanted);
+    (real != wanted).then(|| {
+        back.push(transition(
+            &t.texture,
+            D3D12_RESOURCE_STATES(wanted as i32),
+            D3D12_RESOURCE_STATES(real as i32),
+        ));
+        transition(
+            &t.texture,
+            D3D12_RESOURCE_STATES(real as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        )
+    })
+}
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -3013,5 +3061,437 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    fn committed_texture(format: u32, flags: u32) -> crate::object::This {
+        let heap = [1u32, 0, 0, 0, 0];
+        let words = [
+            3u32,
+            0,
+            0,
+            0,
+            64,
+            0,
+            64,
+            1 | 1 << 16,
+            format,
+            1,
+            0,
+            0,
+            flags,
+            0,
+        ];
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut out = std::ptr::null();
+        let hr = crate::resource::create_committed(
+            std::ptr::null(),
+            heap.as_ptr().cast(),
+            0,
+            words.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(hr, crate::object::S_OK);
+        out
+    }
+
+    fn release_resource(r: crate::object::This) {
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(r, 0x10)(r),
+            0
+        );
+    }
+
+    fn transition_tuple(
+        b: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER,
+    ) -> (usize, i32, i32) {
+        use windows::core::Interface;
+        // SAFETY: tests below only pass transition barriers built by `transition`.
+        let t = unsafe { &*b.Anonymous.Transition };
+        let ptr = t.pResource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        (ptr, t.StateBefore.0, t.StateAfter.0)
+    }
+
+    /// A prelude copy between a depth texture and its writable twin moves
+    /// each texture from its pre-list `state` to the copy state and back
+    /// before advancing `state` to where the list leaves it — including when
+    /// the list itself ends in `COPY_DEST` or `UNORDERED_ACCESS`.
+    #[test]
+    fn prelude_copies_twins_from_their_real_states_before_moving_into_the_list() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let depth = committed_texture(118, 6);
+        let copy = crate::resource::host_copy(depth).expect("a host depth texture");
+        for (fmt, plane) in [(56u32, 0u32), (62, 1)] {
+            let uav = [fmt, 4, 0, plane, 0, 0, 0, 0, 0, 0];
+            assert!(crate::twin::uav(depth, &copy, Some(&uav), host.cpu_view()).is_some());
+        }
+        let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
+        let depth_ptr = copy.texture.as_raw() as usize;
+        let plane_ptrs: [usize; 2] = [
+            twin.planes[0].texture.as_raw() as usize,
+            twin.planes[1].texture.as_raw() as usize,
+        ];
+
+        // Case 1 (`TWIN -> DEPTH`): `depth` sits in `DEPTH_WRITE` (0x10) from
+        // an earlier pass while `twin` holds newer unordered writes (0x8). The
+        // upcoming list reads `depth` as a shader resource (0x80) and ends
+        // copying into it (`COPY_DEST` = 0x400).
+        copy.state.store(0x10, Relaxed);
+        for p in &twin.planes {
+            p.state.store(0x8, Relaxed);
+        }
+        twin.newer.store(crate::twin::TWIN, Relaxed);
+        let list = host.new_list().unwrap();
+        assert_eq!(list.transition(depth, 0x80).map(|(_, s)| s), None);
+        assert_eq!(list.transition(depth, 0x400).map(|(_, s)| s), Some(0x80));
+        let mut pre_copy = Vec::new();
+        let mut post_copy = Vec::new();
+        let entry = list
+            .plan_prelude(|d, tw, to_depth| {
+                assert!(to_depth);
+                let (src, dst) = (0x800, 0x400);
+                let mut back = Vec::new();
+                for p in &tw.planes {
+                    if let Some(b) = super::from_real_state(p, src, &mut back) {
+                        pre_copy.push(transition_tuple(&b));
+                    }
+                }
+                if let Some(b) = super::from_real_state(d, dst, &mut back) {
+                    pre_copy.push(transition_tuple(&b));
+                }
+                post_copy.extend(back.iter().map(transition_tuple));
+            })
+            .expect("prelude work");
+        assert_eq!(
+            pre_copy,
+            vec![
+                (plane_ptrs[0], 0x8, 0x800),
+                (plane_ptrs[1], 0x8, 0x800),
+                (depth_ptr, 0x10, 0x400),
+            ],
+            "depth must transition out of DEPTH_WRITE even when the list ends in COPY_DEST"
+        );
+        assert_eq!(
+            post_copy,
+            vec![
+                (plane_ptrs[0], 0x800, 0x8),
+                (plane_ptrs[1], 0x800, 0x8),
+                (depth_ptr, 0x400, 0x10),
+            ]
+        );
+        assert_eq!(
+            entry.iter().map(transition_tuple).collect::<Vec<_>>(),
+            vec![(depth_ptr, 0x10, 0x80)]
+        );
+        assert_eq!(copy.state.load(Relaxed), 0x400);
+
+        // Case 2 (`DEPTH -> TWIN`): `depth` sits in `DEPTH_WRITE` (0x10) and
+        // the twin's planes are still in `COMMON` (0). The upcoming list
+        // writes through unordered access (0x8).
+        copy.state.store(0x10, Relaxed);
+        for p in &twin.planes {
+            p.state.store(0, Relaxed);
+        }
+        twin.newer.store(crate::twin::DEPTH, Relaxed);
+        list.close();
+        list.reset();
+        assert!(list.transition(depth, 0x8).is_none());
+        pre_copy.clear();
+        post_copy.clear();
+        let entry = list
+            .plan_prelude(|d, tw, to_depth| {
+                assert!(!to_depth);
+                let (src, dst) = (0x800, 0x400);
+                let mut back = Vec::new();
+                for p in &tw.planes {
+                    if let Some(b) = super::from_real_state(p, dst, &mut back) {
+                        pre_copy.push(transition_tuple(&b));
+                    }
+                }
+                if let Some(b) = super::from_real_state(d, src, &mut back) {
+                    pre_copy.push(transition_tuple(&b));
+                }
+                post_copy.extend(back.iter().map(transition_tuple));
+            })
+            .expect("prelude work");
+        assert_eq!(
+            pre_copy,
+            vec![
+                (plane_ptrs[0], 0, 0x400),
+                (plane_ptrs[1], 0, 0x400),
+                (depth_ptr, 0x10, 0x800),
+            ],
+            "twin planes must transition from COMMON, not from their post-list UAV state"
+        );
+        assert_eq!(
+            post_copy,
+            vec![
+                (plane_ptrs[0], 0x400, 0),
+                (plane_ptrs[1], 0x400, 0),
+                (depth_ptr, 0x800, 0x10),
+            ]
+        );
+        let mut entry_tuples: Vec<_> = entry.iter().map(transition_tuple).collect();
+        entry_tuples.sort_by_key(|t| t.0);
+        let mut want_entry = vec![(plane_ptrs[0], 0, 0x8), (plane_ptrs[1], 0, 0x8)];
+        want_entry.sort_by_key(|t| t.0);
+        assert_eq!(entry_tuples, want_entry);
+        assert_eq!(twin.planes[0].state.load(Relaxed), 0x8);
+        assert_eq!(twin.planes[1].state.load(Relaxed), 0x8);
+        assert_eq!(copy.state.load(Relaxed), 0x10);
+
+        list.close();
+        list.reset();
+        drop(copy);
+        release_resource(depth);
+    }
+
+    /// Across separate command lists in multi-list submissions, `prelude`
+    /// converts 16-bit depth and 8-bit stencil from the writable twin into
+    /// the host depth texture (`TWIN -> DEPTH`) and back (`DEPTH -> TWIN`).
+    #[test]
+    fn prelude_synchronizes_depth_twins_across_submitted_lists() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let depth = committed_texture(118, 6);
+        let copy = crate::resource::host_copy(depth).expect("a host depth texture");
+        for (fmt, plane) in [(56u32, 0u32), (62, 1)] {
+            let uav = [fmt, 4, 0, plane, 0, 0, 0, 0, 0, 0];
+            assert!(crate::twin::uav(depth, &copy, Some(&uav), host.cpu_view()).is_some());
+        }
+        let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
+
+        // SAFETY: live host resources.
+        let (dd, p0, p1) = unsafe {
+            (
+                copy.texture.GetDesc(),
+                twin.planes[0].texture.GetDesc(),
+                twin.planes[1].texture.GetDesc(),
+            )
+        };
+        let mut df = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        let mut tf = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        let mut depth_bytes = 0u64;
+        // SAFETY: outputs sized for the queried subresources.
+        let twin_bytes = unsafe {
+            host.device.GetCopyableFootprints(
+                &dd,
+                0,
+                2,
+                0,
+                Some(df.as_mut_ptr()),
+                None,
+                None,
+                Some(&mut depth_bytes),
+            );
+            let mut end0 = 0u64;
+            host.device.GetCopyableFootprints(
+                &p0,
+                0,
+                1,
+                0,
+                Some(&mut tf[0]),
+                None,
+                None,
+                Some(&mut end0),
+            );
+            let base1 = end0.next_multiple_of(512);
+            let mut size1 = 0u64;
+            host.device.GetCopyableFootprints(
+                &p1,
+                0,
+                1,
+                base1,
+                Some(&mut tf[1]),
+                None,
+                None,
+                Some(&mut size1),
+            );
+            base1 + size1
+        };
+        let (upload, up_ptr) = host.upload_buffer(twin_bytes).unwrap();
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let k = (1 + x + 64 * y) as u16;
+                let s = ((x ^ y) & 0xff) as u8;
+                // SAFETY: within the mapped upload footprints.
+                unsafe {
+                    let off0 = tf[0].Offset as usize + y * tf[0].Footprint.RowPitch as usize + x * 2;
+                    (up_ptr.add(off0) as *mut u16).write(k);
+                    up_ptr
+                        .add(tf[1].Offset as usize + y * tf[1].Footprint.RowPitch as usize + x)
+                        .write(s);
+                }
+            }
+        }
+        let (depth_out, depth_ptr) = host.shared_buffer(depth_bytes).unwrap();
+        let (twin_out, twin_ptr) = host.shared_buffer(twin_bytes).unwrap();
+        let at = |r: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: sub,
+            },
+        };
+        let placed = |r: &ID3D12Resource, fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(r) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: fp,
+                },
+            }
+        };
+
+        // Submission 1: `list1` populates the twin; `list2` reads the depth
+        // texture in a separate command list (`list2.prelude()` runs
+        // `TWIN -> DEPTH` while `copy` starts in `COMMON` and ends in
+        // `COPY_SOURCE`).
+        let list1 = host.new_list().unwrap();
+        let list2 = host.new_list().unwrap();
+        assert!(list1.transition(depth, 0x8).is_none());
+        for (p, plane) in twin.planes.iter().enumerate() {
+            if let Some(b) = list1.move_texture(plane, 0x400) {
+                // SAFETY: an open list and live plane texture.
+                unsafe { list1.list.ResourceBarrier(&[b]) };
+            }
+            // SAFETY: an open list; source and destination are live.
+            unsafe {
+                list1.list.CopyTextureRegion(
+                    &at(&plane.texture, 0),
+                    0,
+                    0,
+                    0,
+                    &placed(&upload, tf[p]),
+                    None,
+                );
+            }
+        }
+        list1.close();
+
+        crate::list::ensure_state(&list2, depth, 0x800);
+        // SAFETY: an open list; `list2.prelude()` brings `copy.texture` up to
+        // date and into `COPY_SOURCE`.
+        unsafe {
+            list2.list.CopyTextureRegion(
+                &placed(&depth_out, df[0]),
+                0,
+                0,
+                0,
+                &at(&copy.texture, 0),
+                None,
+            );
+            list2.list.CopyTextureRegion(
+                &placed(&depth_out, df[1]),
+                0,
+                0,
+                0,
+                &at(&copy.texture, 1),
+                None,
+            );
+        }
+        list2.close();
+        host.execute(&[&list1, &list2]);
+        assert_eq!(host.log_messages(), None);
+
+        let d24 = |u: u32| u * 256 + (u * 255 + 32767) / 65535;
+        for (x, y) in [(0usize, 0usize), (5, 0), (17, 40), (63, 63)] {
+            let k = (1 + x + 64 * y) as u32;
+            // SAFETY: within `depth_out`'s mapped footprints.
+            let (word, byte) = unsafe {
+                let off0 = df[0].Offset as usize + y * df[0].Footprint.RowPitch as usize + x * 4;
+                (
+                    (depth_ptr.add(off0) as *const u32).read(),
+                    depth_ptr
+                        .add(df[1].Offset as usize + y * df[1].Footprint.RowPitch as usize + x)
+                        .read(),
+                )
+            };
+            assert_eq!(word & 0xff_ffff, d24(k), "24-bit depth at {x},{y}");
+            assert_eq!(byte, ((x ^ y) & 0xff) as u8, "stencil at {x},{y}");
+        }
+
+        // Submission 2: `list3` clears the depth texture in `DEPTH_WRITE`;
+        // `list4` uses unordered access in a separate list (`list4.prelude()`
+        // runs `DEPTH -> TWIN` from `DEPTH_WRITE`).
+        let list3 = host.new_list().unwrap();
+        let list4 = host.new_list().unwrap();
+        crate::list::ensure_state(&list3, depth, 0x10);
+        let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let handle = host.dsv(&copy.texture, Some(&dsv));
+        // SAFETY: an open list, the texture in `DEPTH_WRITE`.
+        unsafe {
+            list3.list.ClearDepthStencilView(
+                handle,
+                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                0.25,
+                0x33,
+                None,
+            );
+        }
+        list3.close();
+
+        assert!(list4.transition(depth, 0x8).is_none());
+        for (p, plane) in twin.planes.iter().enumerate() {
+            if let Some(b) = list4.move_texture(plane, 0x800) {
+                // SAFETY: an open list and live plane texture.
+                unsafe { list4.list.ResourceBarrier(&[b]) };
+            }
+            // SAFETY: an open list; `list4.prelude()` populated `plane`.
+            unsafe {
+                list4.list.CopyTextureRegion(
+                    &placed(&twin_out, tf[p]),
+                    0,
+                    0,
+                    0,
+                    &at(&plane.texture, 0),
+                    None,
+                );
+            }
+        }
+        list4.close();
+        host.execute(&[&list3, &list4]);
+        assert_eq!(host.log_messages(), None);
+
+        for (x, y) in [(0usize, 0usize), (31, 19), (63, 63)] {
+            // SAFETY: within `twin_out`'s mapped footprints.
+            let (half, byte) = unsafe {
+                let off0 = tf[0].Offset as usize + y * tf[0].Footprint.RowPitch as usize + x * 2;
+                (
+                    (twin_ptr.add(off0) as *const u16).read(),
+                    twin_ptr
+                        .add(tf[1].Offset as usize + y * tf[1].Footprint.RowPitch as usize + x)
+                        .read(),
+                )
+            };
+            assert_eq!(half, 16384, "16-bit depth at {x},{y}");
+            assert_eq!(byte, 0x33, "stencil at {x},{y}");
+        }
+
+        for l in [&list1, &list2, &list3, &list4] {
+            l.reset();
+        }
+        drop(copy);
+        release_resource(depth);
     }
 }
