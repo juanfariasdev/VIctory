@@ -59,6 +59,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// The [`Host::shared_buffer`]s small enough to share heaps.
+    small_buffers: crate::placed::Pool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -243,6 +245,7 @@ fn create() -> windows::core::Result<Host> {
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
         Ok(Host {
+            small_buffers: crate::placed::Pool::new(device.clone()),
             device,
             queue,
             fence,
@@ -2505,7 +2508,8 @@ struct Presenter {
 }
 
 /// The frame rate, shown in the window's caption every second and logged
-/// every few seconds.
+/// every few seconds. Its once-a-second tick also releases one of the small
+/// buffers' spare heaps.
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -2546,6 +2550,11 @@ impl Meter {
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
+        }
+        // One heap that small buffers left empty goes back a second; only the
+        // presenter's lock is held here, and nothing but presenting takes it.
+        if let Some(host) = host() {
+            host.small_buffers.release_spare();
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
@@ -2596,6 +2605,9 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                if let Some(host) = host() {
+                    host.small_buffers.log();
+                }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -2831,39 +2843,59 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// The memory of [`Host::shared_buffer`]'s buffers: system memory that the
+/// CPU maps write-back.
+pub(crate) const SHARED_HEAP: D3D12_HEAP_PROPERTIES = D3D12_HEAP_PROPERTIES {
+    Type: D3D12_HEAP_TYPE_CUSTOM,
+    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+    CreationNodeMask: 0,
+    VisibleNodeMask: 0,
+};
+
+/// The description of a [`Host::shared_buffer`] of `width_bytes`.
+pub(crate) fn shared_buffer_desc(width_bytes: u64) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: width_bytes.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    }
+}
+
 impl Host {
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
-    /// the common state (buffers move out of it implicitly).
-    pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
+    /// the common state (buffers move out of it implicitly), zeroed over
+    /// `width_bytes`. One of up to [`crate::placed::SLOT_BYTES`] shares a
+    /// heap ([`crate::placed`]), and past its width lie other buffers'
+    /// bytes: a caller whose shaders may read it through a root descriptor
+    /// past that width asks for whole slots, which keeps such a read in its
+    /// own buffer up to the slot's end.
+    pub(crate) fn shared_buffer(
+        &'static self,
+        width_bytes: u64,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(placed) = self.small_buffers.buffer(width_bytes) {
+            return Some(placed);
+        }
+        let desc = shared_buffer_desc(width_bytes);
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
-                    &heap,
+                    &SHARED_HEAP,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -2878,7 +2910,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, width_bytes, "no shared buffer");
                 None
             }
         }
