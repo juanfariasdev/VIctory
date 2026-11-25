@@ -74,6 +74,25 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
+/// Library counts and bytes, for the once-a-second memory log (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn library_stats() -> (u64, u64, u64, usize, u64) {
+    library::stats()
+}
+
+/// Number of cached shader containers and the bytes they hold (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shader_stats() -> (usize, u64) {
+    let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    match shaders.as_ref() {
+        None => (0, 0),
+        Some(map) => (
+            map.len(),
+            map.values().map(|s| s.container.len() as u64).sum(),
+        ),
+    }
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);

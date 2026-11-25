@@ -350,6 +350,13 @@ impl Pool {
         Ok((buffer, data.cast()))
     }
 
+    /// Bytes of heap memory held by the pool (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bytes(&self) -> u64 {
+        let slots = self.lock();
+        slots.heaps.iter().flatten().count() as u64 * HEAP_BYTES
+    }
+
     /// Logs the heaps held and the buffers alive in them (diagnostics).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn log(&self) {

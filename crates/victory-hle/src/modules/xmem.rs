@@ -50,6 +50,59 @@ pub(crate) fn on_wine() -> bool {
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
+/// Bytes the title has reserved and committed through XMem, and the size of
+/// its physical-page sections (diagnostics, `VICTORY_MEM_STATS=1`). They are
+/// cumulative allocations: frees are not subtracted, so they show how much
+/// the title has asked for, not how much is live.
+static RESERVED: AtomicUsize = AtomicUsize::new(0);
+static COMMITTED: AtomicUsize = AtomicUsize::new(0);
+static PHYSICAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+static REPORTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Title memory totals, for diagnostics.
+pub fn mem_stats() -> (usize, usize, usize) {
+    (
+        RESERVED.load(Ordering::Relaxed),
+        COMMITTED.load(Ordering::Relaxed),
+        PHYSICAL_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Logs a new line whenever the title asks for another 256 MiB (diagnostics).
+fn report_mem() {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_MEM_STATS").is_some_and(|v| v != "0")
+    });
+    if !*ON {
+        return;
+    }
+    let (reserved, committed, physical) = mem_stats();
+    let total = reserved + committed + physical;
+    let last = REPORTED.fetch_max(total, Ordering::Relaxed);
+    if total >= last.saturating_add(256 * MIB) {
+        tracing::info!(
+            reserved_mb = reserved / MIB,
+            committed_mb = committed / MIB,
+            physical_mb = physical / MIB,
+            "title memory (XMem)"
+        );
+    }
+}
+
+fn note_title_alloc(kind: u32, size: usize, reservation: bool) {
+    if kind & MEM_COMMIT != 0 {
+        COMMITTED.fetch_add(size, Ordering::Relaxed);
+    } else if reservation {
+        RESERVED.fetch_add(size, Ordering::Relaxed);
+    }
+    report_mem();
+}
+
+fn note_physical(size: usize) {
+    PHYSICAL_BYTES.fetch_add(size, Ordering::Relaxed);
+    report_mem();
+}
+
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
 /// privilege.
@@ -153,6 +206,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() {
+        note_title_alloc(kind, size, base.is_null());
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -501,6 +557,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    note_physical(size);
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;

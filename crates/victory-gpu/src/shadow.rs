@@ -85,6 +85,16 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Bytes of idle snapshot memory kept in the pool (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pool_bytes() -> u64 {
+    POOL.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|v| v.capacity() as u64)
+        .sum()
+}
+
 /// Bytes of idle snapshot memory kept besides the largest buffer.
 const POOL_BYTES: usize = 256 << 20;
 
@@ -807,6 +817,19 @@ static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new(
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Registered title buffers and the bytes they span, and how many have a
+/// host copy (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffers_stats() -> (usize, u64, usize) {
+    let buffers = buffers();
+    let mut bytes = 0;
+    for (&(start, _), e) in buffers.iter() {
+        bytes += e.end.saturating_sub(start);
+    }
+    let made = buffers.values().filter(|e| e.shadow.is_some()).count();
+    (buffers.len(), bytes, made)
 }
 
 /// Counts copies made and title buffers released: [`all`] may differ when

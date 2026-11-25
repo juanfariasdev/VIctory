@@ -146,7 +146,7 @@ from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft
 or a current Windows SDK. Set its path for the test session:
 
 ```powershell
-$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
+$env:VICTORY_DXIL = 'D:\Desenvolvimento\dxc\bin\x64\dxil.dll'
 cargo test -p victory-shader --lib --locked -- --test-threads=1
 ```
 
@@ -184,6 +184,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
+| `VICTORY_MEM_STATS=1` | once a second, logs the process's working set and private bytes, free RAM and system commit, and the emulator's counted caches (textures, shaders, pipeline library, snapshot and small-buffer pools) |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
 | `VICTORY_ADAPTER=<spec>` | selects the host GPU: `dgpu` / `high-performance` (default), `igpu` / `minimum-power`, DXGI index, or name substring |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |

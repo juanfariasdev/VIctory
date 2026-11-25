@@ -852,6 +852,12 @@ struct Deferred {
 }
 
 impl Host {
+    /// Bytes held by the small-buffer heap pool (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn small_buffer_bytes(&self) -> u64 {
+        self.small_buffers.bytes()
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -2556,6 +2562,8 @@ impl Meter {
         if let Some(host) = host() {
             host.small_buffers.release_spare();
         }
+        #[cfg(feature = "diagnostics")]
+        crate::memstat::log();
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();

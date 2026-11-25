@@ -39,6 +39,8 @@ mod indirect;
 pub mod list;
 #[cfg(windows)]
 mod memory;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

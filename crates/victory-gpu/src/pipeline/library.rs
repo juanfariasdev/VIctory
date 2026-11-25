@@ -700,6 +700,20 @@ fn created() -> (u64, usize) {
     (created.0, created.1.as_ref().map_or(0, HashSet::len))
 }
 
+/// Pipelines made and loaded, title keys created, and the library blob's
+/// bytes (diagnostics). `try_lock` keeps the once-a-second log from waiting
+/// on a save or a load.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stats() -> (u64, u64, u64, usize, u64) {
+    let made = MADE.load(Ordering::Relaxed);
+    let loaded = LOADED.load(Ordering::Relaxed);
+    let (created, distinct) = created();
+    let bytes = library()
+        .and_then(|l| l.try_lock().ok())
+        .map_or(0, |l| l._blob.bytes().len() as u64);
+    (made, loaded, created, distinct, bytes)
+}
+
 /// Title pipeline keys drawn or dispatched with: in earlier runs (the
 /// list as loaded), and in this one.
 #[derive(Default)]
