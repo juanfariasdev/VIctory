@@ -1030,9 +1030,10 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // D3D12_RESOURCE_DESC::Flags must be created with a format that either
     // can be used as unordered access, or cast to a format that could be used
     // as unordered access" (id 599, #1754). The title asks for it on its
-    // 2560x1440 `B5G5R5A1_UNORM` targets. The permission goes here, before
-    // any device call names the description, and is said once per format.
-    if d.flags & UNORDERED != 0 && typed_uav(d.format) == Some(false) {
+    // 2560x1440 `B5G5R5A1_UNORM` targets. Check MSAA and typed-UAV support here
+    // (for a typeless family, whether any typed format in the family supports
+    // it), before any device call names the description.
+    if d.flags & UNORDERED != 0 && (d.sample_count > 1 || typed_uav(d.format) == Some(false)) {
         d.flags &= !UNORDERED;
         static NOTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
         let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -1040,6 +1041,7 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
             noted.push(d.format);
             tracing::warn!(
                 format = d.format,
+                sample_count = d.sample_count,
                 "dropping unordered access: the host cannot use this format as a typed UAV"
             );
         }
@@ -1047,14 +1049,31 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
-/// Whether the host can make a typed unordered access view of `format`:
-/// D3D12 answers it, and a description that asks for the permission on a
-/// format it refuses is not merely wrong, it ends the device (id 599).
-/// `None` when the host cannot be asked: an unknown answer leaves the
-/// description as the title wrote it, because dropping a permission that
-/// was legal would silently lose a texture's writes.
-#[cfg(windows)]
+/// Whether the host can make a typed unordered access view of `format` (or of
+/// any typed format in its family if `format` is typeless): D3D12 answers it,
+/// and a description that asks for the permission on a format it refuses ends
+/// the device (id 599). `None` when the host cannot be asked: an unknown answer
+/// leaves the description as the title wrote it, because dropping a permission
+/// that was legal would silently lose a texture's writes.
 fn typed_uav(format: u32) -> Option<bool> {
+    if family(format) == format && family(format + 1) == format {
+        let mut any_known = false;
+        for f in (format + 1)..=115 {
+            if family(f) == format {
+                match typed_uav_single(f) {
+                    Some(true) => return Some(true),
+                    Some(false) => any_known = true,
+                    None => {}
+                }
+            }
+        }
+        return any_known.then_some(false);
+    }
+    typed_uav_single(format)
+}
+
+#[cfg(windows)]
+fn typed_uav_single(format: u32) -> Option<bool> {
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
@@ -1096,7 +1115,7 @@ fn typed_uav(format: u32) -> Option<bool> {
 
 /// Without a host to ask, nothing is known either way.
 #[cfg(not(windows))]
-fn typed_uav(_format: u32) -> Option<bool> {
+fn typed_uav_single(_format: u32) -> Option<bool> {
     None
 }
 
@@ -1957,7 +1976,7 @@ mod tests {
         }
         // Which formats take a typed UAV is the driver's answer, not ours:
         // the rule is that the permission follows it, whatever it says.
-        for format in [27u32, 28, 41, 86] {
+        for format in [27u32, 28, 29, 41, 86] {
             println!("format {format}: typed_uav={:?}", typed_uav(format));
             let desc = ResourceDesc {
                 dimension: 3,
@@ -1973,7 +1992,7 @@ mod tests {
                 flags: 5, // render target and unordered access
             };
             let made = host_desc(&desc).unwrap();
-            let expected = if typed_uav(format) == Some(false) {
+            let expected = if typed_uav(made.format) == Some(false) {
                 1
             } else {
                 5
@@ -1983,6 +2002,38 @@ mod tests {
                 "format {format}: the UAV permission follows the host's answer"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_desc_keeps_typeless_and_srgb_uav_but_drops_b5g5r5a1() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make = |format| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 256,
+            height: 256,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 5, // ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS
+        };
+        // Typeless R8G8B8A8 (27) and sRGB R8G8B8A8_UNORM_SRGB (29 -> family 27)
+        // support typed UAVs via R8G8B8A8_UNORM/UINT and must keep UNORDERED.
+        assert_ne!(host_desc(&make(27)).unwrap().flags & UNORDERED, 0);
+        assert_ne!(host_desc(&make(29)).unwrap().flags & UNORDERED, 0);
+        // B5G5R5A1_UNORM (86) has no typed UAV support in D3D12.
+        if typed_uav(86) == Some(false) {
+            let b5g5r5a1 = host_desc(&make(86)).unwrap();
+            assert_eq!(b5g5r5a1.flags & UNORDERED, 0);
+            assert_ne!(b5g5r5a1.flags & 1, 0);
+        }
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

@@ -520,10 +520,9 @@ impl State {
             (self.host_pipeline, self.host_roots[1]) = (0, 0);
         }
         // Heaps first: a root signature with directly indexed heaps must be
-        // set after them. Title memory's views need a view heap: ours where
-        // the title binds none (the BVH builder's dispatches may not).
-        let memory_heap = self.heaps[0] == 0
-            && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
+        // set after them. Every host root signature indexes both heaps
+        // directly, so bind our fallback view heap whenever the title binds none.
+        let memory_heap = self.heaps[0] == 0;
         self.bind_heaps(list, memory_heap);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -1864,11 +1863,6 @@ fn describe(view: Option<&View>) -> String {
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
-}
-
-/// Whether a shader reads root views through views the host makes.
-fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
-    t.user_data.iter().any(is_root_view)
 }
 
 /// The console's own primitive topologies.

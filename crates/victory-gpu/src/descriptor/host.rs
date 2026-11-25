@@ -95,10 +95,13 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
+/// Fallback dynamic slots when `count` is too large to fit [`DYNAMIC`] plus
+/// the null buffer slots inside `PORTABLE_VIEWS`.
+const MIN_DYNAMIC: u32 = 1 << 16;
+
 /// Slots kept past the dynamic ones for a host copy's two views
-/// ([`HostHeap::pair`]): room for the copies a submission names. Without
-/// them a heap of exactly `HEAP_VIEWS` slots sends every pair to a dynamic
-/// slot instead, which the clamp can then reach.
+/// ([`HostHeap::pair`]): room for the copies a submission names when `count`
+/// leaves space below `NULL_BUFFER_VIEW - 1`.
 const PAIR_RESERVE: u32 = 1 << 16;
 
 impl HostHeap {
@@ -149,15 +152,10 @@ impl HostHeap {
         // smaller than that is one a shader can index past, and the read
         // faults the device (a removal on the host).
         const {
-            assert!(victory_shader::emit::HEAP_VIEWS <= PORTABLE_VIEWS);
-            // The clamp bound is not the whole heap: the dynamic slots and
-            // the pair slots live past it, and D3D12 gives no more than
-            // `PORTABLE_VIEWS` in all.
+            assert!(victory_shader::emit::HEAP_VIEWS == PORTABLE_VIEWS);
             assert!(
-                victory_shader::emit::HEAP_VIEWS as u64
-                    + DYNAMIC as u64
-                    + PAIR_RESERVE as u64
-                    <= PORTABLE_VIEWS as u64
+                (DYNAMIC as u64 + PAIR_RESERVE as u64)
+                    < victory_shader::emit::NULL_BUFFER_VIEW as u64
             );
         }
         let (heap, count, extra) = if sampler {
@@ -169,45 +167,33 @@ impl HostHeap {
                 }
             }
         } else {
-            // At least every slot a shader may name, and no more than D3D12
-            // gives: past `PORTABLE_VIEWS` there is no heap to ask for.
-            let needed = count.max(views);
-            let pair_room = PAIR_RESERVE;
-            // Everything a heap has to hold: the title's own slots (or the
-            // clamp bound, whichever is larger), the dynamic slots, and the
-            // pair slots past them. `extra` is the dynamic count alone, so
-            // `pair` starts at `count + extra` and has room to the end.
-            let least = needed.saturating_add(pair_room);
-            if least > PORTABLE_VIEWS {
+            // Reserve `NULL_BUFFER_VIEW - 1` (null raw UAV), `NULL_BUFFER_VIEW`
+            // (null raw SRV), and `HEAP_VIEWS - 1` (clamped-index null slot) at
+            // the top of the `HEAP_VIEWS` heap. All title, dynamic, and pair
+            // slots live below `tail` so no valid descriptor index is ever
+            // clamped to `HEAP_VIEWS - 1`.
+            let tail = victory_shader::emit::NULL_BUFFER_VIEW - 1;
+            let (fitted, extra) = if count.saturating_add(DYNAMIC).saturating_add(PAIR_RESERVE) <= tail {
+                (count, DYNAMIC)
+            } else if count.saturating_add(DYNAMIC) <= tail {
+                (count, DYNAMIC)
+            } else if count.saturating_add(MIN_DYNAMIC) <= tail {
+                (count, MIN_DYNAMIC)
+            } else {
+                let fitted = tail - MIN_DYNAMIC;
                 tracing::warn!(
                     count,
+                    fitted,
                     views,
-                    "title view heap needs more slots than the host allows"
+                    "host view heap capped at {views}; views past {fitted} read a null slot"
                 );
-                return None;
-            }
-            let wanted = least.saturating_add(DYNAMIC).min(PORTABLE_VIEWS);
-            let dynamic = wanted - least;
-            match make(wanted) {
-                Ok(heap) => (heap, count, dynamic),
-                // The full dynamic range does not fit beside the title's own
-                // slots, but every index the clamp reaches does: fewer
-                // dynamic slots costs throughput, fewer than `views` costs
-                // the device.
+                (fitted, MIN_DYNAMIC)
+            };
+            match make(views) {
+                Ok(heap) => (heap, fitted, extra),
                 Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        count,
-                        dynamic,
-                        "host view heap without the full dynamic range"
-                    );
-                    match make(least) {
-                        Ok(heap) => (heap, count, 0),
-                        Err(e) => {
-                            tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                            return None;
-                        }
-                    }
+                    tracing::warn!(error = %e, count, views, "no host descriptor heap");
+                    return None;
                 }
             }
         };
@@ -1102,14 +1088,14 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || typed_store(own));
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
+    if unordered && !typed_store(view) {
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }

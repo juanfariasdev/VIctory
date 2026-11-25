@@ -23,17 +23,12 @@ pub const MEMORY_SPACE: u32 = 2;
 /// are at least this large, the slots past their own null (`emit`, "Heap
 /// indices").
 ///
-/// D3D12 takes exactly 1,000,000 descriptors in a shader-visible CBV/SRV/UAV
-/// heap on every resource binding tier and refuses one more (`E_OUTOFMEMORY`,
-/// measured on an RTX 5070 Ti). That ceiling has to hold the clamp bound
-/// *and* the slots `victory-gpu` keeps past the title's own: the dynamic
-/// ones for tables a draw needs made afresh, and the pair slots for host
-/// copies' views. So the bound sits well below the ceiling, not at it.
-///
-/// It used to be `1 << 21`, above what any device gives: the heap request
-/// failed, the fallback heap was smaller, and translated shaders clamped to
-/// an index that heap did not have (a device removal on the first read).
-pub const HEAP_VIEWS: u32 = 1 << 19;
+/// D3D12 takes up to 1,000,000 descriptors in a shader-visible CBV/SRV/UAV
+/// heap across all hardware tiers and refuses one more (`E_OUTOFMEMORY`).
+/// Matching `HEAP_VIEWS` to that ceiling lets `victory-gpu` allocate exact
+/// 1,000,000-slot heaps on every host, placing title, dynamic, and pair slots
+/// below `NULL_BUFFER_VIEW - 1` so no valid slot is ever clamped away.
+pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
