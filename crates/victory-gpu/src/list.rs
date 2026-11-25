@@ -304,18 +304,24 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
-/// Pushes `b` onto `out` as barriers on host resources, if it names ones
-/// the host GPU has (buffers so far have none).
+/// Pushes `b` onto `out` as barriers on host resources if it names ones
+/// the host GPU has (buffers so far have none), or ignores a texture
+/// whose host texture is not made yet: a barrier is not a use, and the
+/// texture's first use in a list moves it where that use needs.
 #[cfg(windows)]
 fn push_host_barriers(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<Barrier>) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let host =
+        |r: This| crate::resource::host_resource_made(r).map(|h| h.as_raw().cast_const().cast());
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
             const BEGIN_ONLY: u32 = 1;
             if b.flags & BEGIN_ONLY != 0 {
+                return;
+            }
+            if crate::resource::host_resource_made(b.first).is_none() {
                 return;
             }
             // shortcut: whole resources, from the state the list tracked
@@ -355,6 +361,9 @@ fn push_host_barriers(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<B
         }
         2 if b.first.is_null() => out.push(*b),
         2 => {
+            if crate::resource::host_resource_made(b.first).is_none() {
+                return;
+            }
             let Some(copy) = crate::resource::host_copy(b.first) else {
                 return;
             };
