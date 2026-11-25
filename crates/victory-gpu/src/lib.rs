@@ -42,6 +42,8 @@ mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod placed;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
