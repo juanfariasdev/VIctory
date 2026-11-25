@@ -1192,6 +1192,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // The levels the view can read: a texture only ever viewed from
+            // a higher level is uploaded from there on (`crate::texture`).
+            crate::texture::note_view(resource, crate::texture::first_level(desc.as_ref()));
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 let mut desc = desc.as_ref().map(srv_desc);
