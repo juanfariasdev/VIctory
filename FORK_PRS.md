@@ -21,6 +21,19 @@ This fork keeps `main` tracking clean `upstream/main` (`Marvisak/VIctory`) and i
 | [#1803](https://github.com/Marvisak/VIctory/pull/1803) | `mgunes1311-lab` | GPU: copy depth twins from pre-list states in prelude and route depth UAV barriers to twin planes | Preserves pre-list texture states during `HostList::prelude` depth-twin copies so barriers do not emit invalid transitions |
 | [#2367](https://github.com/Marvisak/VIctory/pull/2367) | `PanS4ge` | GPU: select host DXGI adapter via VICTORY_ADAPTER and log GPU | Logs the selected GPU adapter at startup and allows explicit adapter selection via `VICTORY_ADAPTER` |
 
+### VRAM, RAM & Disk I/O Optimizations on `custom`
+
+| PR | Author | Title | Purpose |
+|---|---|---|---|
+| [#2143](https://github.com/Marvisak/VIctory/pull/2143) | `desp` | Shaders: a program's constant table starts after its instructions | Fixes multi-GB NVIDIA VRAM reservation from embedding program code inside shader constant tables |
+| [#2162](https://github.com/Marvisak/VIctory/pull/2162) | `desp` | GPU: depth twins share their scratch buffers | Shares one scratch buffer per power-of-two size class across depth twins (~280–325 MB VRAM saved) |
+| [#2153](https://github.com/Marvisak/VIctory/pull/2153) | `desp` | GPU: cap idle snapshot pool memory | Caps shadow snapshot pool at 256 MiB (`POOL_BYTES`) and replaces per-texture `Last::read` with shared `SCRATCH` |
+| [#2149](https://github.com/Marvisak/VIctory/pull/2149) | `0xkn0wh3r3` | GPU: textures viewed only from a smaller level are uploaded from it on | Stages, detiles, and watches only the viewed mip prefix (`first..mips`) of single 2D textures |
+| [#2427](https://github.com/Marvisak/VIctory/pull/2427) | `imjustprism` | Overlap DirectStorage reads, cache title packs, pool small placed buffers | Opens `.rpf` archives with `FILE_FLAG_OVERLAPPED`, enables OS file cache on pack reads, and suballocates `<= 64 KiB` buffers |
+| [#2129](https://github.com/Marvisak/VIctory/pull/2129) | `0xkn0wh3r3` | GPU: map the pipeline library's file instead of reading it into memory | Memory-maps `host-pipelines.bin` for reading and serialization instead of allocating multi-GB `Vec<u8>` buffers in RAM |
+| [#2221](https://github.com/Marvisak/VIctory/pull/2221) | `0xkn0wh3r3` | GPU: host textures are made on a title texture's first use, not with the resource | Defers D3D12 host texture allocation until first actual GPU use (`OnceLock`) instead of at resource creation |
+| [#2161](https://github.com/Marvisak/VIctory/pull/2161) | `0xkn0wh3r3` | GPU: release idle placed textures, sooner past 90% of the VRAM budget | Evicts idle placed textures (5s/4 frames normally, 1s/2 frames past 90% VRAM budget) freeing VRAM and staging buffers |
+
 ## Managing This Fork
 
 ### Sync `main` with upstream
