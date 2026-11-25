@@ -65,28 +65,47 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            // `Vec::with_capacity` aborts when the allocation fails: try it
+            // first, and on failure free the idle buffers (none fits) before
+            // one last attempt, which still aborts if that fails too.
+            let mut v = Vec::new();
+            if v.try_reserve_exact(n).is_err() && !pool.is_empty() {
+                tracing::warn!(
+                    bytes = n,
+                    "snapshot allocation failed; freeing the idle pool"
+                );
+                pool.clear();
+            }
+            v.reserve_exact(n);
+            v
+        }
     };
     v.clear();
     v
 }
 
-/// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
-/// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
+/// Bytes of idle snapshot memory kept besides the largest buffer.
+const POOL_BYTES: usize = 256 << 20;
+
+/// Returns a snapshot buffer to the pool: the largest is always kept (it is
+/// the one whose reuse saves millions of page faults), the others while
+/// they add up to `POOL_BYTES` (and at most 8 in all).
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
+    let mut kept = 0usize;
+    let mut n = 0usize;
     pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
+        n += 1;
+        if n == 1 {
+            return true;
+        }
+        kept += v.capacity();
+        n <= 8 && kept <= POOL_BYTES
     });
 }
-
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
