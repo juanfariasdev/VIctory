@@ -217,14 +217,21 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget left (shared across all threads).
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    let left = {
+        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 != frame {
+            *spent = (frame, Duration::ZERO);
+        }
+        let left = BUDGET.saturating_sub(spent.1);
+        spent.1 += left;
+        left
+    };
+    if left.is_zero() {
+        return;
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -235,7 +242,12 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    drop(held);
+    let waited = started.elapsed().min(left);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 == frame {
+        spent.1 = spent.1.saturating_sub(left - waited);
+    }
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
@@ -321,7 +333,8 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// the cache saved (at most every 20 s).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
-    if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+    let big_batch = PEAK.swap(0, Ordering::Relaxed) >= 10;
+    if big_batch {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -329,7 +342,7 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
+    super::library::save(big_batch);
 }
 
 #[cfg(test)]

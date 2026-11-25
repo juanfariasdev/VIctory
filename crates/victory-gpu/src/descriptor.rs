@@ -184,7 +184,7 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
+                for index in first..last.min(u64::from(host.count())) {
                     host.mirror(index as u32, start + index * step, false);
                 }
             }

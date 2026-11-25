@@ -681,29 +681,36 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
-                tracing::warn!(
-                    index,
-                    count = self.count,
-                    for_draw,
-                    "title slot past the host heap"
-                );
+            if tag == VIEW_TAG {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        index,
+                        count = self.count,
+                        for_draw,
+                        "title slot past the host heap"
+                    );
+                });
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made[index as usize] != 0 {
+                made[index as usize] = 0;
+                self.make_null(index);
+                self.note_address(index, None);
+            }
+            return None;
+        }
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): nothing to read.
+        let Some(view) = view_at(i, generation) else {
+            // View of a resource the title released: nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);

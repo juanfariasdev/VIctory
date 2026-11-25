@@ -183,6 +183,9 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() == bytes.len() as u64) {
+        return Ok(());
+    }
     crate::publish::write_if_changed(path, bytes)
         .with_context(|| format!("publishing {}", path.display()))
 }

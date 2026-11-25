@@ -297,39 +297,52 @@ pub(crate) fn save(now: bool) {
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+        match *last {
+            Some(t) if !now && t.elapsed() < SAVE_EVERY => return,
+            None if !now => {
+                *last = Some(std::time::Instant::now());
+                return;
+            }
+            _ => {}
         }
         *last = Some(std::time::Instant::now());
     }
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !l.prebuilt_changed && !used_changed {
             return;
         }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
+        if l.added == 0 && !l.prebuilt_changed {
+            (None, None)
+        } else {
+            // SAFETY: a buffer of the size the library asks for.
+            let bytes = unsafe {
+                let mut bytes = vec![0u8; l.library.GetSerializedSize()];
+                l.library.Serialize(&mut bytes).map(|()| bytes)
+            };
+            match bytes {
+                Ok(bytes) => {
+                    l.added = 0;
+                    l.prebuilt_changed = false;
+                    // Kept beside the bytes it holds for (also when a run adds
+                    // pipelines).
+                    let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                    (Some(bytes), prebuilt)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    return;
+                }
             }
         }
     };
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| match &blob {
+            Some(bytes) => write_atomically(&dir.join(LIBRARY_FILE), bytes),
+            None => Ok(()),
+        })
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
@@ -339,7 +352,7 @@ pub(crate) fn save(now: bool) {
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes = blob.as_ref().map_or(0, Vec::len),
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
