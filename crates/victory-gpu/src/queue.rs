@@ -227,7 +227,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(windows, feature = "diagnostics"))]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -299,6 +299,8 @@ extern "system" fn present(
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
+    #[cfg(windows)]
+    crate::resource::let_go_idle();
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
